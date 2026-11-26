@@ -1,0 +1,25 @@
+{
+  "database": "~/.local/share/sonar/memory.db",
+  "index": "~/.local/share/sonar/index",
+  "modelRoot": "~/.local/share/sonar/models",
+  "socket": "~/.local/share/sonar/sonar.sock",
+  "socketMode": 384,
+  "policyFile": "~/.config/sonar/policy.json",
+  "sources": [
+    "~/notes",
+    "~/projects"
+  ],
+  "trustedRoots": [],
+  "embeddingModel": "Xenova/multilingual-e5-small",
+  "rerankerModel": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+  "rerankerEnabled": true,
+  "preloadReranker": true,
+  "rerankDefaultK": 8,
+  "rerankAdaptiveK": 8,
+  "rerankDeepK": 20,
+  "rerankTimeoutMs": 250,
+  "searchThreads": 2,
+  "rerankThreads": 4,
+  "reindexThreads": 2,
+  "minMemAvailableGiB": 1.5
+}

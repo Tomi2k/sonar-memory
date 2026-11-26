@@ -1,0 +1,18 @@
+{
+  "version": "my-policy-v1",
+  "trustedRoots": [],
+  "extraSkipDirs": ["archive-raw", "exports"],
+  "extraWorktreeDirPatterns": ["^my-repo-wt-"],
+  "extraHardExcludePatterns": ["_raw_export_.*\\.json\\.md$"],
+  "extraArchivePatterns": [
+    "(^|/)meeting-transcripts(/|$)",
+    "(^|/)old-runs(/|$)"
+  ],
+  "extraCoreCuratedPatterns": [
+    "(?:^|/)handbook/"
+  ],
+  "projectRules": [
+    { "regex": "(?:^|/)projects/([^/]+)/", "group": 1 },
+    { "regex": "(?:^|/)clients/([^/]+)/", "group": 1, "prefix": "client:" }
+  ]
+}

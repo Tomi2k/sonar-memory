@@ -1,0 +1,29 @@
+{
+  "name": "sonar",
+  "version": "1.0.0",
+  "description": "Sonar — Offline local AI memory engine (SQLite FTS5, INT8 vector scan, multilingual ONNX, cross-encoder, status & conflict tracking, MCP)",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "sonar": "./cli/sonar.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/unit/*.test.mjs test/contract/*.test.mjs",
+    "test:unit": "node --test test/unit/*.test.mjs",
+    "test:contract": "node --test test/contract/*.test.mjs",
+    "eval": "node eval/harness.mjs",
+    "server": "node --expose-gc server/mcp-server.mjs",
+    "reindex": "node ingest/reindex.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.3.2",
+    "better-sqlite3": "12.11.1",
+    "zod": "4.6.7"
+  },
+  "allowScripts": [
+    "better-sqlite3"
+  ]
+}

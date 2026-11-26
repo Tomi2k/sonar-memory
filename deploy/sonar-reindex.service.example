@@ -1,0 +1,20 @@
+[Unit]
+Description=Sonar — Incremental Index Builder (isolated cgroup)
+
+[Service]
+Type=oneshot
+User=sonar
+Group=sonar
+UMask=0077
+Environment=HOME=/var/lib/sonar
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStart=/usr/bin/node --expose-gc /opt/sonar/ingest/reindex.mjs --config /etc/sonar/config.json --threads 2 --batch-size 16 --min-mem 1.5
+MemoryHigh=3G
+MemoryMax=4G
+CPUQuota=200%
+Nice=10
+IOSchedulingClass=idle
+PrivateNetwork=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sonar

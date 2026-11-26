@@ -1,0 +1,7 @@
+[
+  {"id": "ex-01", "category": "exact-id", "query": "BUG-1042", "expected": ["BUGS"]},
+  {"id": "ex-02", "category": "de-de", "query": "Wie stelle ich die lokale Datensicherung wieder her?", "expected": ["backup-restore-runbook"]},
+  {"id": "ex-03", "category": "en-en", "query": "How does the offline ONNX cross-encoder timeout fallback work?", "expected": ["architecture-overview"]},
+  {"id": "ex-04", "category": "cross-lingual", "query": "How to restore database backups after server loss?", "expected": ["datensicherung-wiederherstellung"]},
+  {"id": "ex-05", "category": "project-filter", "project": "webapp", "query": "sticky table header layout fix", "expected": ["BUGS"]}
+]
