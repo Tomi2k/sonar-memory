@@ -46,8 +46,20 @@ export class CanonicalStore {
     this.dbPath = dbPath;
     this.stateRoot = options.stateRoot || path.dirname(path.resolve(dbPath));
     this.screenOptions = options.screenOptions || {};
+    this.allowRuleMutations = options.allowRuleMutations !== false;
     this.db = new Database(dbPath);
     ensureCanonicalSchema(this.db);
+  }
+
+  _assertRuleMutationAllowed(action, confirmed) {
+    if (!this.allowRuleMutations) {
+      throw new Error(`Rule/user_claim ${action} is disabled by server configuration (allowMcpRuleMutations: false)`);
+    }
+    if (!confirmed) {
+      const flag = action === 'supersede' ? 'confirm_rule_supersede' : 'confirm_rule_write';
+      const verb = action === 'supersede' ? 'Superseding' : (action === 'delete' ? 'Deleting' : (action === 'purge' ? 'Purging' : 'Creating or overwriting'));
+      throw new Error(`${verb} kind="rule" or user_claim entries requires explicit ${flag}: true`);
+    }
   }
 
   close() {
@@ -93,20 +105,23 @@ export class CanonicalStore {
       throw new Error(`Ungültiger kind "${kind}".`);
     }
 
-    // Secret-Screening (Gitleaks mit Regelversion)
-    if (!hooks.skipSecretScreen) {
-      const check = screenSingleWrite(key, content, this.stateRoot, this.screenOptions);
-      if (check.blocked) {
-        throw new Error('Possible credential detected: use the secret store, not knowledge memory');
-      }
-    }
-
     const upsert = input.upsert !== false;
     const now = Date.now();
     const expiresAt = typeof input.ttl === 'number' && input.ttl > 0 ? now + Math.round(input.ttl * 1000) : null;
     const tagsJson = JSON.stringify(Array.isArray(input.tags) ? input.tags : []);
     const metadataObj = (input.metadata && typeof input.metadata === 'object') ? input.metadata : {};
     const metadataJson = JSON.stringify(metadataObj);
+    if (metadataJson.length > 16_384) {
+      throw new Error('Metadata überschreitet das Limit von 16 KiB.');
+    }
+
+    // Secret-Screening (Gitleaks mit Regelversion) auf content, tags und metadata
+    if (!hooks.skipSecretScreen) {
+      const check = screenSingleWrite(key, `${content}\n${tagsJson}\n${metadataJson}`, this.stateRoot, this.screenOptions);
+      if (check.blocked) {
+        throw new Error('Possible credential detected: use the secret store, not knowledge memory');
+      }
+    }
     const validFrom = input.valid_from ?? now;
     const validTo = input.valid_to ?? null;
     const reviewAfter = input.review_after ?? null;
@@ -119,9 +134,9 @@ export class CanonicalStore {
     const embeddingModel = hooks.embeddingModel || 'sonar-pending';
     const embeddingDim = embeddingArr ? embeddingArr.length : null;
 
-    // Existierende Zeile prüfen (inkl. strict-insert und Tombstone-Wiederbelebung)
+    // Existierende Zeile prüfen (inkl. strict-insert, Rule-/User-Claim-Schutz und Tombstone-Wiederbelebung)
     const existing = this.db.prepare(
-      'SELECT id, status, created_at FROM memory_entries WHERE namespace = ? AND key = ?'
+      'SELECT id, status, created_at, kind, provenance_type FROM memory_entries WHERE namespace = ? AND key = ?'
     ).get(namespace, key);
 
     if (existing && !upsert && existing.status === 'active') {
@@ -131,6 +146,14 @@ export class CanonicalStore {
         namespace,
         error: `Entry "${namespace}/${key}" already exists (pass upsert: true to update)`
       };
+    }
+
+    const touchesProtectedEntry =
+      kind === 'rule' ||
+      provenance === 'user_claim' ||
+      Boolean(existing && (existing.kind === 'rule' || existing.provenance_type === 'user_claim'));
+    if (touchesProtectedEntry) {
+      this._assertRuleMutationAllowed('write', input.confirm_rule_write === true);
     }
 
     const entryId = existing?.id || `entry_${now}_${crypto.randomBytes(8).toString('hex')}`;
@@ -195,7 +218,13 @@ export class CanonicalStore {
         if (rc.blocked) throw new Error('Possible credential detected in supersede_reason');
       }
       for (const oldRaw of supersedesList) {
-        this._linkSupersedesTx(ref, this._resolveRefInput(oldRaw), cleanReason, input.created_by || 'agent');
+        this._linkSupersedesTx(
+          ref,
+          this._resolveRefInput(oldRaw),
+          cleanReason,
+          input.created_by || 'agent',
+          input.confirm_rule_supersede === true
+        );
       }
 
       const seq = this._logChange(ref, 'upsert', { key, namespace, kind, scope });
@@ -346,14 +375,17 @@ export class CanonicalStore {
   /**
    * Weiches Löschen (kompatibel zu `memory_delete`: setzt status='deleted' für Tombstone-Schutz).
    */
-  delete(namespace, key) {
+  delete(namespace, key, options = {}) {
     const ns = String(namespace || 'default');
     const row = this.db.prepare(
-      "SELECT id FROM memory_entries WHERE namespace = ? AND key = ? AND (status IS NULL OR status != 'deleted')"
+      "SELECT id, status, kind, provenance_type FROM memory_entries WHERE namespace = ? AND key = ? AND (status IS NULL OR status != 'deleted')"
     ).get(ns, key);
     if (!row) {
       const rem = this.db.prepare("SELECT count(*) AS n FROM memory_entries WHERE status = 'active'").get().n;
       return { success: false, deleted: false, key, namespace: ns, remainingEntries: rem, error: 'Entry not found' };
+    }
+    if (row.kind === 'rule' || row.provenance_type === 'user_claim') {
+      this._assertRuleMutationAllowed('delete', options?.confirm_rule_write === true);
     }
     const ref = `memory_entries:${row.id}`;
     const tx = this.db.transaction(() => {
@@ -380,10 +412,13 @@ export class CanonicalStore {
    * schreibt ein minimales `purge`-Tombstone ins Journal, leert das WAL und entfernt
    * ältere Backup-Indexgenerationen auf der Platte.
    */
-  purge(namespace, key) {
+  purge(namespace, key, options = {}) {
     const ns = String(namespace || 'default');
-    const row = this.db.prepare('SELECT id FROM memory_entries WHERE namespace = ? AND key = ?').get(ns, key);
+    const row = this.db.prepare('SELECT id, status, kind, provenance_type FROM memory_entries WHERE namespace = ? AND key = ?').get(ns, key);
     if (!row) return { success: false, purged: false, key, namespace: ns };
+    if (row.kind === 'rule' || row.provenance_type === 'user_claim') {
+      this._assertRuleMutationAllowed('purge', options?.confirm_rule_write === true);
+    }
     const ref = `memory_entries:${row.id}`;
     const tx = this.db.transaction(() => {
       this.db.prepare('DELETE FROM memory_relations WHERE from_ref = ? OR to_ref = ?').run(ref, ref);
@@ -468,7 +503,7 @@ export class CanonicalStore {
     return false;
   }
 
-  _linkSupersedesTx(newRef, oldRef, reason = '', createdBy = 'agent') {
+  _linkSupersedesTx(newRef, oldRef, reason = '', createdBy = 'agent', confirmRuleSupersede = false) {
     // Only canonical `memory_entries:*` entries may be superseded via MCP tools;
     // prevents cross-trust hijacking of `own-rule`/Markdown sources or blackholing via bogus target refs.
     if (!oldRef.startsWith('memory_entries:') || !newRef.startsWith('memory_entries:')) {
@@ -476,9 +511,12 @@ export class CanonicalStore {
     }
     const oldId = oldRef.slice('memory_entries:'.length);
     const newId = newRef.slice('memory_entries:'.length);
-    const oldRow = this.db.prepare('SELECT id, status FROM memory_entries WHERE id = ?').get(oldId);
+    const oldRow = this.db.prepare('SELECT id, status, kind, provenance_type FROM memory_entries WHERE id = ?').get(oldId);
     if (!oldRow || oldRow.status === 'deleted') {
       throw new Error(`old_ref nicht gefunden oder gelöscht: ${oldRef}`);
+    }
+    if (oldRow.kind === 'rule' || oldRow.provenance_type === 'user_claim') {
+      this._assertRuleMutationAllowed('supersede', confirmRuleSupersede === true);
     }
     const newRow = this.db.prepare('SELECT id, status, expires_at FROM memory_entries WHERE id = ?').get(newId);
     if (!newRow || newRow.status === 'deleted') {
@@ -515,12 +553,12 @@ export class CanonicalStore {
     return clean;
   }
 
-  supersede({ old_ref, new_ref, reason = '', created_by = 'agent' }) {
+  supersede({ old_ref, new_ref, reason = '', created_by = 'agent', confirm_rule_supersede = false }) {
     const oldRef = this._resolveRefInput(old_ref);
     const newRef = this._resolveRefInput(new_ref);
     const cleanReason = this._screenReason(reason, 'supersede-reason');
     const tx = this.db.transaction(() => {
-      this._linkSupersedesTx(newRef, oldRef, cleanReason, created_by);
+      this._linkSupersedesTx(newRef, oldRef, cleanReason, created_by, confirm_rule_supersede === true);
       return this._logChange(oldRef, 'status', { action: 'supersede', oldRef, newRef, reason: cleanReason });
     });
     const seq = tx();
@@ -561,7 +599,7 @@ export class CanonicalStore {
     return { success: true, relation_id: res.id, ref_a: fromRef, ref_b: toRef, state: 'open', reason: cleanReason, seq: res.seq };
   }
 
-  resolveConflict({ relation_id, winner_ref, reason = '', resolved_by = 'agent', supersede_loser = true }) {
+  resolveConflict({ relation_id, winner_ref, reason = '', resolved_by = 'agent', supersede_loser = true, confirm_rule_supersede = false }) {
     const rel = this.db.prepare('SELECT * FROM memory_relations WHERE id = ?').get(Number(relation_id));
     if (!rel) throw new Error(`Relation #${relation_id} nicht gefunden.`);
     const winner = this._resolveRefInput(winner_ref);
@@ -583,7 +621,7 @@ export class CanonicalStore {
         WHERE id = ?
       `).run(winner, now, String(resolved_by).slice(0, 64), cleanReason, rel.id);
       if (canSupersedeLoser) {
-        this._linkSupersedesTx(winner, loser, cleanReason || `Konflikt #${rel.id} entschieden`, resolved_by);
+        this._linkSupersedesTx(winner, loser, cleanReason || `Konflikt #${rel.id} entschieden`, resolved_by, confirm_rule_supersede === true);
       }
       return this._logChange(winner, 'relation', { action: 'resolve', relationId: rel.id, winner, loser });
     });

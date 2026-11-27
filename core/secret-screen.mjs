@@ -16,9 +16,13 @@ function resolveGitleaksBin(override) {
   if (process.env.SONAR_GITLEAKS_BIN) return process.env.SONAR_GITLEAKS_BIN;
   const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
   for (const d of [...dirs, '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']) {
+    if (!path.isAbsolute(d)) continue;
     const candidate = path.join(d, 'gitleaks');
     try {
-      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      }
     } catch { /* ignore */ }
   }
   return '';
@@ -139,13 +143,41 @@ export function screenSources(sources, stateRoot, options = {}) {
 
     if (pending.length && scanDir) {
       const reportPath = path.join(scanDir, 'report.json');
-      const glArgs = ['dir', scanDir, '--no-banner', '--redact', '--report-format', 'json', '--report-path', reportPath];
+      const GITLEAKS_LEAK_EXIT = 99;
+      const glArgs = [
+        'dir', scanDir,
+        '--no-banner',
+        '--redact',
+        '--exit-code', String(GITLEAKS_LEAK_EXIT),
+        '--report-format', 'json',
+        '--report-path', reportPath
+      ];
       if (scanner.cfgPath) glArgs.push('--config', scanner.cfgPath);
       const r = spawnSync(scanner.binPath, glArgs, { encoding: 'utf8', timeout: 180000 });
-      if (![0, 1].includes(r.status)) {
-        throw new Error(`Secret scan failed (exit ${r.status}); refusing indexing`);
+      if (r.error) {
+        throw new Error(`Secret scan execution failed (${r.error.message}); refusing indexing`);
       }
-      const findings = fs.existsSync(reportPath) ? JSON.parse(fs.readFileSync(reportPath, 'utf8')) : [];
+      if (r.status !== 0 && r.status !== GITLEAKS_LEAK_EXIT) {
+        const detail = (r.stderr || r.stdout || '').trim().split('\n')[0] || 'unknown error';
+        throw new Error(`Secret scan failed (exit ${r.status}: ${detail.slice(0, 160)}); refusing indexing (requires Gitleaks 8.19+)`);
+      }
+      let findings = [];
+      if (r.status === GITLEAKS_LEAK_EXIT) {
+        if (!fs.existsSync(reportPath)) {
+          throw new Error(`Secret scan exited ${GITLEAKS_LEAK_EXIT} without writing report.json; refusing indexing`);
+        }
+        const parsed = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+        if (!Array.isArray(parsed)) {
+          throw new Error('Secret scan produced an invalid JSON report; refusing indexing');
+        }
+        findings = parsed;
+      } else if (fs.existsSync(reportPath)) {
+        const parsed = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+        if (!Array.isArray(parsed)) {
+          throw new Error('Secret scan produced an invalid JSON report; refusing indexing');
+        }
+        findings = parsed;
+      }
       const blockedFiles = new Set(findings.map((f) => path.basename(f.File || '')));
       for (const e of pending) {
         old[e.id] = { cacheKey: e.cacheKey, blocked: blockedFiles.has(e.file) };

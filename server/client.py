@@ -10,17 +10,29 @@ import sys
 def resolve_socket_path():
     if os.environ.get('SONAR_SOCKET'):
         return os.path.expanduser(os.environ['SONAR_SOCKET'])
-    cfg_path = os.path.expanduser(os.environ.get('SONAR_CLIENT_CONFIG') or '~/.config/sonar/client.json')
-    try:
-        with open(cfg_path, 'r', encoding='utf-8') as f:
-            cfg_sock = json.load(f).get('socket')
-            if isinstance(cfg_sock, str) and cfg_sock.strip():
-                return os.path.expanduser(cfg_sock.strip())
-    except OSError:
-        pass
-    except ValueError:
-        pass
-    return os.path.expanduser(os.environ.get('SONAR_DEFAULT_SOCKET') or '/run/sonar/mcp.sock')
+    candidates = [
+        os.environ.get('SONAR_CLIENT_CONFIG'),
+        '~/.config/sonar/client.json',
+        '~/.config/sonar/config.json',
+        '/etc/sonar/config.json',
+    ]
+    for raw in candidates:
+        if not raw:
+            continue
+        cfg_path = os.path.expanduser(raw)
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg_sock = json.load(f).get('socket')
+                if isinstance(cfg_sock, str) and cfg_sock.strip():
+                    return os.path.expanduser(cfg_sock.strip())
+        except (OSError, ValueError):
+            pass
+    if os.environ.get('SONAR_DEFAULT_SOCKET'):
+        return os.path.expanduser(os.environ['SONAR_DEFAULT_SOCKET'])
+    user_sock = os.path.expanduser('~/.local/share/sonar/sonar.sock')
+    if os.path.exists(user_sock) or not os.path.exists('/run/sonar/mcp.sock'):
+        return user_sock
+    return '/run/sonar/mcp.sock'
 
 
 class UnixHTTP(http.client.HTTPConnection):

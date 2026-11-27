@@ -72,9 +72,13 @@ export const TOOL_CATALOGUE = [
         scope: { type: 'string', description: 'Scope (e.g. global, mac, vps, production)' },
         supersedes: { description: 'Optional old entry ref(s) replaced by this entry' },
         supersede_reason: { type: 'string' },
+        created_by: { type: 'string' },
         valid_from: { type: 'number' },
         valid_to: { type: 'number' },
-        review_after: { type: 'number' }
+        review_after: { type: 'number' },
+        confirm_rule_write: { type: 'boolean', description: 'Required to create or overwrite kind="rule" or provenance_type="user_claim" entries' },
+        confirm_rule_supersede: { type: 'boolean', description: 'Required when superseding kind="rule" or provenance_type="user_claim" entries' },
+        metadata: { type: 'object', description: 'Optional structured metadata object (max 16 KiB JSON, secret-screened)' }
       },
       required: ['key', 'value']
     }
@@ -112,7 +116,8 @@ export const TOOL_CATALOGUE = [
       type: 'object',
       properties: {
         key: { type: 'string' },
-        namespace: { type: 'string', description: 'Namespace (default: "default")' }
+        namespace: { type: 'string', description: 'Namespace (default: "default")' },
+        confirm_rule_write: { type: 'boolean', description: 'Required to soft-delete kind="rule" or provenance_type="user_claim" entries' }
       },
       required: ['key']
     }
@@ -163,7 +168,8 @@ export const TOOL_CATALOGUE = [
         old_ref: { type: 'string', description: 'Old entry ID, memory_entries:<id>, or namespace/key' },
         new_ref: { type: 'string', description: 'New active entry ID, memory_entries:<id>, or namespace/key' },
         reason: { type: 'string', description: 'Why the old entry is superseded' },
-        created_by: { type: 'string' }
+        created_by: { type: 'string' },
+        confirm_rule_supersede: { type: 'boolean', description: 'Required to supersede kind="rule" or provenance_type="user_claim" entries' }
       },
       required: ['old_ref', 'new_ref']
     }
@@ -192,7 +198,8 @@ export const TOOL_CATALOGUE = [
         winner_ref: { type: 'string' },
         reason: { type: 'string' },
         resolved_by: { type: 'string' },
-        supersede_loser: { type: 'boolean', description: 'Also mark loser as superseded by winner (default: true)' }
+        supersede_loser: { type: 'boolean', description: 'Also mark loser as superseded by winner (default: true)' },
+        confirm_rule_supersede: { type: 'boolean', description: 'Required when resolving supersedes a kind="rule" or provenance_type="user_claim" loser' }
       },
       required: ['relation_id', 'winner_ref']
     }
@@ -214,7 +221,8 @@ export const TOOL_CATALOGUE = [
       properties: {
         key: { type: 'string' },
         namespace: { type: 'string', description: 'Namespace (default: "default")' },
-        confirm: { type: 'boolean', description: 'Must be true to execute hard purge' }
+        confirm: { type: 'boolean', description: 'Must be true to execute hard purge' },
+        confirm_rule_write: { type: 'boolean', description: 'Also required when purging kind="rule" or provenance_type="user_claim" entries' }
       },
       required: ['key', 'confirm']
     }
@@ -222,13 +230,13 @@ export const TOOL_CATALOGUE = [
 ];
 
 const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-const WRITE_ANNOTATIONS = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const WRITE_ANNOTATIONS = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const DESTRUCTIVE_ANNOTATIONS = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
 
 const TOOL_ANNOTATIONS = {
   memory_search_unified: READ_ONLY_ANNOTATIONS,
   memory_search: READ_ONLY_ANNOTATIONS,
-  memory_store: WRITE_ANNOTATIONS,
+  memory_store: DESTRUCTIVE_ANNOTATIONS,
   memory_retrieve: READ_ONLY_ANNOTATIONS,
   memory_list: READ_ONLY_ANNOTATIONS,
   memory_delete: DESTRUCTIVE_ANNOTATIONS,
@@ -237,9 +245,9 @@ const TOOL_ANNOTATIONS = {
   memory_stats: READ_ONLY_ANNOTATIONS,
   memory_bridge_status: READ_ONLY_ANNOTATIONS,
   memory_import_claude: READ_ONLY_ANNOTATIONS,
-  memory_supersede: WRITE_ANNOTATIONS,
+  memory_supersede: DESTRUCTIVE_ANNOTATIONS,
   memory_flag_conflict: WRITE_ANNOTATIONS,
-  memory_resolve: WRITE_ANNOTATIONS,
+  memory_resolve: DESTRUCTIVE_ANNOTATIONS,
   memory_history: READ_ONLY_ANNOTATIONS,
   memory_purge: DESTRUCTIVE_ANNOTATIONS
 };
@@ -289,7 +297,11 @@ export const TOOL_SCHEMAS = {
     valid_from: z.number().finite().optional(),
     valid_to: z.number().finite().nullable().optional(),
     review_after: z.number().finite().nullable().optional(),
-    metadata: z.record(z.string(), z.unknown()).optional()
+    confirm_rule_write: z.boolean().optional(),
+    confirm_rule_supersede: z.boolean().optional(),
+    metadata: z.record(z.string(), z.unknown())
+      .refine((m) => JSON.stringify(m).length <= 16384, { message: 'metadata exceeds 16 KiB cap' })
+      .optional()
   }).passthrough(),
   memory_retrieve: z.object({
     key: z.string().min(1).max(256),
@@ -304,7 +316,8 @@ export const TOOL_SCHEMAS = {
   }).passthrough(),
   memory_delete: z.object({
     key: z.string().min(1).max(256),
-    namespace: z.string().min(1).max(128).optional()
+    namespace: z.string().min(1).max(128).optional(),
+    confirm_rule_write: z.boolean().optional()
   }).passthrough(),
   memory_source: z.object({
     id: z.string().min(1).max(1024)
@@ -321,7 +334,8 @@ export const TOOL_SCHEMAS = {
     old_ref: z.string().min(1).max(512),
     new_ref: z.string().min(1).max(512),
     reason: z.string().max(500).optional(),
-    created_by: z.string().max(64).optional()
+    created_by: z.string().max(64).optional(),
+    confirm_rule_supersede: z.boolean().optional()
   }).passthrough(),
   memory_flag_conflict: z.object({
     ref_a: z.string().min(1).max(512),
@@ -334,7 +348,8 @@ export const TOOL_SCHEMAS = {
     winner_ref: z.string().min(1).max(512),
     reason: z.string().max(500).optional(),
     resolved_by: z.string().max(64).optional(),
-    supersede_loser: z.boolean().optional()
+    supersede_loser: z.boolean().optional(),
+    confirm_rule_supersede: z.boolean().optional()
   }).passthrough(),
   memory_history: z.object({
     ref: z.string().min(1).max(512)
@@ -342,7 +357,8 @@ export const TOOL_SCHEMAS = {
   memory_purge: z.object({
     key: z.string().min(1).max(256),
     namespace: z.string().min(1).max(128).optional(),
-    confirm: z.literal(true)
+    confirm: z.literal(true),
+    confirm_rule_write: z.boolean().optional()
   }).passthrough()
 };
 
@@ -356,7 +372,8 @@ export class SonarServer {
       fs.mkdirSync(this.cfg.index, { recursive: true, mode: 0o700 });
       this.canonical = new CanonicalStore(this.cfg.database, {
         stateRoot: this.cfg.index,
-        screenOptions: this.cfg.screenOptions || {}
+        screenOptions: this.cfg.screenOptions || {},
+        allowRuleMutations: this.cfg.allowMcpRuleMutations === true
       });
     } finally {
       process.umask(prevUmask);
@@ -534,11 +551,15 @@ export class SonarServer {
         return res;
       }
       if (name === 'memory_delete') {
-        return this.canonical.delete(args.namespace || 'default', args.key);
+        return this.canonical.delete(args.namespace || 'default', args.key, {
+          confirm_rule_write: args.confirm_rule_write === true
+        });
       }
       if (name === 'memory_purge') {
         if (args.confirm !== true) throw new Error('memory_purge benötigt confirm: true.');
-        return this.canonical.purge(args.namespace || 'default', args.key);
+        return this.canonical.purge(args.namespace || 'default', args.key, {
+          confirm_rule_write: args.confirm_rule_write === true
+        });
       }
       if (name === 'memory_supersede') {
         return this.canonical.supersede(args);
@@ -638,8 +659,13 @@ export class SonarServer {
         try {
           const pid = Number(fs.readFileSync(lockPath, 'utf8').split('\n')[0]);
           if (pid > 0) {
-            process.kill(pid, 0);
-            alive = true;
+            try {
+              process.kill(pid, 0);
+              alive = true;
+            } catch (killErr) {
+              // EPERM means the process is alive under another UID; only ESRCH confirms it exited.
+              alive = killErr?.code !== 'ESRCH';
+            }
           }
         } catch { alive = false; }
         if (alive || attempt > 0) {

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { CanonicalStore } from '../../core/store/canonical.mjs';
 import { buildIndexGeneration } from '../../ingest/builder.mjs';
 import { SearchEngine } from '../../core/search/engine.mjs';
-import { TOOL_CATALOGUE, TOOL_SCHEMAS } from '../../server/mcp-server.mjs';
+import { TOOL_CATALOGUE, TOOL_SCHEMAS, SonarServer } from '../../server/mcp-server.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '../..');
@@ -54,9 +54,25 @@ test('P0/P3 All 11 legacy MCP tools + 5 new P4/Purge tools are registered', () =
     assert.ok(names.has(req), `Missing MCP tool: ${req}`);
   }
   const purgeTool = TOOL_CATALOGUE.find((t) => t.name === 'memory_purge');
+  const storeTool = TOOL_CATALOGUE.find((t) => t.name === 'memory_store');
+  const delTool = TOOL_CATALOGUE.find((t) => t.name === 'memory_delete');
+  const supTool = TOOL_CATALOGUE.find((t) => t.name === 'memory_supersede');
+  const resTool = TOOL_CATALOGUE.find((t) => t.name === 'memory_resolve');
   const searchTool = TOOL_CATALOGUE.find((t) => t.name === 'memory_search_unified');
   assert.equal(purgeTool.annotations?.destructiveHint, true);
+  assert.equal(storeTool.annotations?.destructiveHint, true);
+  assert.equal(delTool.annotations?.destructiveHint, true);
+  assert.equal(supTool.annotations?.destructiveHint, true);
+  assert.equal(resTool.annotations?.destructiveHint, true);
   assert.equal(searchTool.annotations?.readOnlyHint, true);
+  // Catalogue inputSchema must advertise confirmation flags and metadata (F-01)
+  assert.ok(storeTool.inputSchema.properties.confirm_rule_write);
+  assert.ok(storeTool.inputSchema.properties.confirm_rule_supersede);
+  assert.ok(storeTool.inputSchema.properties.metadata);
+  assert.ok(delTool.inputSchema.properties.confirm_rule_write);
+  assert.ok(purgeTool.inputSchema.properties.confirm_rule_write);
+  assert.ok(supTool.inputSchema.properties.confirm_rule_supersede);
+  assert.ok(resTool.inputSchema.properties.confirm_rule_supersede);
 });
 
 test('End-to-end Golden Contract: Stale-Read Fix, Secret-Screen, Fast-Path, Superseded Redirect & Conflicts', async () => {
@@ -95,18 +111,89 @@ test('End-to-end Golden Contract: Stale-Read Fix, Secret-Screen, Fast-Path, Supe
       /Possible credential/
     );
 
+    // Creating, overwriting, deleting, purging, or superseding kind="rule" / user_claim requires explicit confirmation (F-01)
+    assert.throws(
+      () => canonical.store({ namespace: 'patterns', key: 'untrusted-rule', value: 'hijack', kind: 'rule', provenance_type: 'agent_output' }),
+      /confirm_rule_write/
+    );
+    assert.throws(
+      () => canonical.store({ namespace: 'patterns', key: 'unconfirmed-user-claim', value: 'hijack', kind: 'rule', provenance_type: 'user_claim' }),
+      /confirm_rule_write/
+    );
+    assert.throws(
+      () => canonical.store({ namespace: 'patterns', key: 'bad-tag-secret', value: 'ok', tags: [fakePem] }),
+      /Possible credential/
+    );
+
     const oldRule = canonical.store({
       namespace: 'patterns',
       key: 'local-writer-old',
       value: 'Old local rule: clients write directly to the local database.',
-      kind: 'rule'
+      kind: 'rule',
+      provenance_type: 'user_claim',
+      confirm_rule_write: true
     });
     const newRule = canonical.store({
       namespace: 'patterns',
       key: 'server-writer-new',
       value: 'Active server rule: only the central Sonar daemon writes the database.',
-      kind: 'rule'
+      kind: 'rule',
+      provenance_type: 'user_claim',
+      confirm_rule_write: true
     });
+    assert.throws(
+      () => canonical.store({ namespace: 'patterns', key: 'server-writer-new', value: 'poisoned', provenance_type: 'tool_result', upsert: true }),
+      /confirm_rule_write/
+    );
+    assert.throws(
+      () => canonical.store({ namespace: 'patterns', key: 'server-writer-new', value: 'poisoned', provenance_type: 'user_claim', upsert: true }),
+      /confirm_rule_write/
+    );
+    assert.throws(
+      () => canonical.delete('patterns', 'server-writer-new'),
+      /confirm_rule_write/
+    );
+    assert.throws(
+      () => canonical.purge('patterns', 'server-writer-new'),
+      /confirm_rule_write/
+    );
+    assert.throws(
+      () => canonical.supersede({ old_ref: oldRule.ref, new_ref: newRule.ref, reason: 'unconfirmed agent supersede' }),
+      /confirm_rule_supersede/
+    );
+    // Passing created_by: "user" must NOT bypass confirm_rule_supersede (F-01)
+    assert.throws(
+      () => canonical.supersede({ old_ref: oldRule.ref, new_ref: newRule.ref, reason: 'spoofed user', created_by: 'user' }),
+      /confirm_rule_supersede/
+    );
+    // Test soft-delete + overwrite / purge guard on a protected rule entry regardless of status
+    canonical.store({ namespace: 'patterns', key: 'temp-rule', value: 'Protected temp rule', kind: 'rule', confirm_rule_write: true });
+    assert.throws(() => canonical.delete('patterns', 'temp-rule'), /confirm_rule_write/);
+    canonical.delete('patterns', 'temp-rule', { confirm_rule_write: true });
+    assert.throws(
+      () => canonical.store({ namespace: 'patterns', key: 'temp-rule', value: 'reactivated without confirm', provenance_type: 'agent_output', upsert: true }),
+      /confirm_rule_write/
+    );
+    assert.throws(() => canonical.purge('patterns', 'temp-rule'), /confirm_rule_write/);
+    assert.equal(canonical.purge('patterns', 'temp-rule', { confirm_rule_write: true }).purged, true);
+
+    // SonarServer defaults allowMcpRuleMutations to false (fail-safe against auto-approving MCP clients) (F4)
+    const defaultSrv = new SonarServer({ database: dbPath, index: indexRoot, screenOptions: { requireGitleaks: false } });
+    try {
+      assert.equal(defaultSrv.canonical.allowRuleMutations, false);
+      assert.throws(
+        () => defaultSrv.canonical.store({ namespace: 'patterns', key: 'blocked-rule', value: 'nope', kind: 'rule', confirm_rule_write: true }),
+        /allowMcpRuleMutations: false/
+      );
+    } finally {
+      defaultSrv.canonical.close();
+    }
+    const optInSrv = new SonarServer({ database: dbPath, index: indexRoot, screenOptions: { requireGitleaks: false }, allowMcpRuleMutations: true });
+    try {
+      assert.equal(optInSrv.canonical.allowRuleMutations, true);
+    } finally {
+      optInSrv.canonical.close();
+    }
     const confA = canonical.store({ namespace: 'patterns', key: 'port-a', value: 'Gateway listens on port 8080.' });
     const confB = canonical.store({ namespace: 'patterns', key: 'port-b', value: 'Gateway listens on port 9090.' });
 
@@ -126,7 +213,7 @@ test('End-to-end Golden Contract: Stale-Read Fix, Secret-Screen, Fast-Path, Supe
     engine.loadGeneration();
 
     // 2. Stale-Read-Bug-Fix prüfen: Update & Insert in DB OHNE Index-Rebuild → retrieve UND search liefern SOFORT neuen Wert!
-    canonical.store({ namespace: 'patterns', key: 'server-writer-new', value: 'Updated server rule V2: immediately visible!', upsert: true });
+    canonical.store({ namespace: 'patterns', key: 'server-writer-new', value: 'Updated server rule V2: immediately visible!', kind: 'rule', provenance_type: 'user_claim', confirm_rule_write: true, upsert: true });
     const retrieved = canonical.retrieve('patterns', 'server-writer-new');
     assert.equal(retrieved.value, 'Updated server rule V2: immediately visible!');
     const brandNew = canonical.store({ namespace: 'patterns', key: 'sofort-delta-test-key', value: 'Nagelneuer Eintrag sofort in Suche sichtbar ohne Reindex.' });
@@ -147,7 +234,19 @@ test('End-to-end Golden Contract: Stale-Read Fix, Secret-Screen, Fast-Path, Supe
     assert.ok(umlaut.results.some((r) => r.key === 'BUGS'));
 
     // 6. Superseded redirect: searching old rule returns active successor with notice
-    canonical.supersede({ old_ref: oldRule.ref, new_ref: newRule.ref, reason: 'Single writer migration' });
+    canonical.supersede({ old_ref: oldRule.ref, new_ref: newRule.ref, reason: 'Single writer migration', confirm_rule_supersede: true });
+    // Overwriting an archived rule without confirm_rule_write must also fail (F-01)
+    assert.throws(
+      () => canonical.store({ namespace: 'patterns', key: 'local-writer-old', value: 'hijack archived', provenance_type: 'agent_output', upsert: true }),
+      /confirm_rule_write/
+    );
+    // Resolving a conflict against a rule loser with resolved_by: "user" must NOT bypass confirm_rule_supersede (F-01)
+    const ruleConf = canonical.flagConflict({ ref_a: newRule.ref, ref_b: confA.ref, reason: 'Rule vs pattern' });
+    assert.throws(
+      () => canonical.resolveConflict({ relation_id: ruleConf.relation_id, winner_ref: confA.ref, resolved_by: 'user' }),
+      /confirm_rule_supersede/
+    );
+    canonical.resolveConflict({ relation_id: ruleConf.relation_id, winner_ref: newRule.ref, supersede_loser: false, reason: 'Keep rule' });
     const supRes = await engine.search({ query: 'Old local rule clients write directly database', limit: 5 });
     assert.equal(supRes.results[0].id, newRule.ref);
     assert.ok(supRes.results[0].superseded_notice?.includes('Überholt:'));
@@ -205,9 +304,19 @@ test('End-to-end Golden Contract: Stale-Read Fix, Secret-Screen, Fast-Path, Supe
     const claudeHit = untrustedHits.results.find((r) => r.key === 'CLAUDE');
     assert.ok(claudeHit);
     assert.equal(claudeHit.trust, 'workspace-doc');
+    assert.equal(claudeHit.untrusted, true);
+    assert.ok(claudeHit.content_warning?.includes('UNTRUSTED WORKSPACE DATA'));
     assert.equal(claudeHit.kind, 'doc');
     assert.equal(claudeHit.status, 'current');
     assert.equal(claudeHit.superseded_notice, undefined);
+    // memory_source and memory_sources must also attach untrusted framing to workspace-doc (F-02)
+    const claudeFull = engine.source(claudeHit.id);
+    assert.equal(claudeFull.untrusted, true);
+    assert.ok(claudeFull.content_warning?.includes('UNTRUSTED WORKSPACE DATA'));
+    const listedSources = engine.listSources({ namespace: 'markdown', limit: 50 });
+    const listedClaude = listedSources.sources.find((s) => s.id === claudeHit.id);
+    assert.equal(listedClaude?.untrusted, true);
+    assert.ok(listedClaude?.content_warning?.includes('UNTRUSTED WORKSPACE DATA'));
     assert.throws(
       () => canonical.supersede({ old_ref: claudeHit.id, new_ref: newRule.ref, reason: 'hijack' }),
       /canonical memory_entries/

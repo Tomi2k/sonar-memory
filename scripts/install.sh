@@ -21,10 +21,10 @@ cd "$REPO_DIR"
 # only better-sqlite3 needs its native addon build step.
 npm ci --omit=dev --ignore-scripts
 if [ ! -f "$REPO_DIR/node_modules/better-sqlite3/build/Release/better_sqlite3.node" ]; then
-  if [ "${SONAR_BUILD_FROM_SOURCE:-0}" = "1" ]; then
-    (cd "$REPO_DIR/node_modules/better-sqlite3" && npm_config_build_from_source=true npm run install)
+  if [ "${SONAR_BUILD_FROM_SOURCE:-1}" = "1" ]; then
+    (cd "$REPO_DIR/node_modules/better-sqlite3" && npm_config_ignore_scripts=false npm run build-release)
   else
-    (cd "$REPO_DIR/node_modules/better-sqlite3" && npm run install)
+    (cd "$REPO_DIR/node_modules/better-sqlite3" && npm_config_ignore_scripts=false npm run install)
   fi
 fi
 
@@ -58,6 +58,7 @@ if [ ! -f "$CFG_FILE" ]; then
       policyFile: `${cfgDir}/policy.json`,
       sources: [],
       trustedRoots: [],
+      allowMcpRuleMutations: false,
       embeddingModel: "Xenova/multilingual-e5-small",
       rerankerModel: "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
       rerankerEnabled: true,
@@ -94,25 +95,33 @@ fi
 printf -v Q_REPO '%q' "$REPO_DIR"
 printf -v Q_DATA '%q' "$DATA_DIR"
 
-cat > "$BIN_DIR/sonar-mcp" <<EOF
+write_wrapper() {
+  local target="$1"
+  local tmp
+  tmp="$(mktemp "$BIN_DIR/.sonar-wrapper.XXXXXX")"
+  cat > "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$target"
+}
+
+write_wrapper "$BIN_DIR/sonar-mcp" <<EOF
 #!/usr/bin/env bash
 DEFAULT_SOCK=${Q_DATA}/sonar.sock
 export SONAR_DEFAULT_SOCKET="\${SONAR_DEFAULT_SOCKET:-\$DEFAULT_SOCK}"
 exec python3 ${Q_REPO}/server/client.py "\$@"
 EOF
-cat > "$BIN_DIR/sonar" <<EOF
+write_wrapper "$BIN_DIR/sonar" <<EOF
 #!/usr/bin/env bash
 DEFAULT_SOCK=${Q_DATA}/sonar.sock
 export SONAR_DEFAULT_SOCKET="\${SONAR_DEFAULT_SOCKET:-\$DEFAULT_SOCK}"
 exec node ${Q_REPO}/cli/sonar.mjs "\$@"
 EOF
-cat > "$BIN_DIR/sonar-check" <<EOF
+write_wrapper "$BIN_DIR/sonar-check" <<EOF
 #!/usr/bin/env bash
 DEFAULT_SOCK=${Q_DATA}/sonar.sock
 export SONAR_DEFAULT_SOCKET="\${SONAR_DEFAULT_SOCKET:-\$DEFAULT_SOCK}"
 exec node ${Q_REPO}/cli/sonar-check.mjs "\$@"
 EOF
-chmod 755 "$BIN_DIR/sonar-mcp" "$BIN_DIR/sonar" "$BIN_DIR/sonar-check"
 
 echo ""
 echo "Sonar installed successfully."

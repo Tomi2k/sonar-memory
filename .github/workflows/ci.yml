@@ -18,7 +18,7 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: cd node_modules/better-sqlite3 && npm run install
+      - run: cd node_modules/better-sqlite3 && npm_config_ignore_scripts=false npm run build-release
       - run: node -e 'Promise.all([import("onnxruntime-node"), import("@huggingface/transformers")]).then(([o,h])=>{if(!o?.InferenceSession||!h?.pipeline)process.exit(1);console.log("ONNX native binding OK");})'
       - run: npm test
       - run: npm audit --omit=dev --audit-level=high

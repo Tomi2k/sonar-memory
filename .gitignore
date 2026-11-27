@@ -7,6 +7,7 @@ __pycache__/
 *.db-shm
 .env
 .env.*
+.npmrc
 *.local.json
 config.local.json
 policy.local.json

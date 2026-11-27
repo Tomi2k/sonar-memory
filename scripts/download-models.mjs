@@ -32,29 +32,56 @@ for (const modelId of selected) {
   for (const [rel, meta] of Object.entries(spec.files || {})) {
     const dest = path.join(modelRoot, modelId, rel);
     const expectedSha = meta?.sha256;
-    if (!expectedSha) {
-      throw new Error(`Refusing unverified download: missing sha256 in manifest for ${modelId}/${rel}`);
+    const expectedBytes = Number(meta?.bytes);
+    if (!expectedSha || !Number.isInteger(expectedBytes) || expectedBytes <= 0) {
+      throw new Error(`Refusing unverified download: missing sha256 or byte size in manifest for ${modelId}/${rel}`);
     }
     const remoteRel = meta.remotePath || rel;
     const url = `https://huggingface.co/${modelId}/resolve/${spec.revision}/${remoteRel}`;
     fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
-    if (fs.existsSync(dest) && sha256File(dest) === expectedSha) {
+    if (fs.existsSync(dest) && fs.statSync(dest).size === expectedBytes && sha256File(dest) === expectedSha) {
       console.log(`  [ok] ${rel} (cached & verified)`);
       continue;
     }
     console.log(`  [dl] ${rel}`);
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    const tmp = `${dest}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    fs.writeFileSync(tmp, buf, { mode: 0o600, flag: 'wx' });
-    const actualSha = sha256File(tmp);
-    if (actualSha !== expectedSha) {
-      fs.unlinkSync(tmp);
-      throw new Error(`SHA-256 mismatch for ${rel}: expected ${expectedSha}, got ${actualSha}`);
+    const contentLength = Number(res.headers.get('content-length') || 0);
+    if (contentLength > expectedBytes) {
+      throw new Error(`Download rejected for ${rel}: Content-Length (${contentLength}) exceeds manifest bytes (${expectedBytes})`);
     }
-    fs.renameSync(tmp, dest);
-    console.log(`  [verified] ${rel} (${buf.byteLength} bytes, sha256=${actualSha.slice(0, 12)}...)`);
+    if (!res.body) throw new Error(`Download failed: empty response body for ${url}`);
+    const tmp = `${dest}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    const hash = crypto.createHash('sha256');
+    let fd = null;
+    let writtenBytes = 0;
+    try {
+      fd = fs.openSync(tmp, 'wx', 0o600);
+      for await (const chunk of res.body) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        writtenBytes += buf.byteLength;
+        if (writtenBytes > expectedBytes) {
+          throw new Error(`Download aborted for ${rel}: exceeded expected byte cap (${expectedBytes})`);
+        }
+        hash.update(buf);
+        fs.writeSync(fd, buf);
+      }
+      fs.closeSync(fd);
+      fd = null;
+      if (writtenBytes !== expectedBytes) {
+        throw new Error(`Byte length mismatch for ${rel}: expected ${expectedBytes}, got ${writtenBytes}`);
+      }
+      const actualSha = hash.digest('hex');
+      if (actualSha !== expectedSha) {
+        throw new Error(`SHA-256 mismatch for ${rel}: expected ${expectedSha}, got ${actualSha}`);
+      }
+      fs.renameSync(tmp, dest);
+      console.log(`  [verified] ${rel} (${writtenBytes} bytes, sha256=${actualSha.slice(0, 12)}...)`);
+    } catch (err) {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      throw err;
+    }
   }
 }
 console.log('\nAll offline ONNX models verified and ready in:', modelRoot);

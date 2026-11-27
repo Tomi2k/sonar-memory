@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   normalizeText,
   stemWord,
@@ -12,10 +14,14 @@ import {
 } from '../../core/normalize.mjs';
 import { chunkText } from '../../core/chunker.mjs';
 import { createPolicy, shouldSkipDirectory, classifyMarkdownSource, classifyKind, classifyTrust } from '../../ingest/policy.mjs';
+import { collectAndClassifySources } from '../../ingest/builder.mjs';
 import { screenSources } from '../../core/secret-screen.mjs';
 import { resolveConfigPaths } from '../../core/paths.mjs';
 import { quantizeInt8, Int8VectorStore } from '../../core/search/vector-scan.mjs';
 import { CanonicalStore } from '../../core/store/canonical.mjs';
+
+const __unitDir = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__unitDir, '../..');
 
 test('normalizeText folds German umlauts consistently (Prüfung == Pruefung, Straße == Strasse)', () => {
   assert.equal(normalizeText('Prüfung'), normalizeText('Pruefung'));
@@ -51,6 +57,47 @@ test('chunkText prepends Context-Header (Project › Key › H1 › H2) and resp
   assert.ok(chunks[0].header.includes('webapp › STATE › Haupttitel'));
   assert.ok(chunks.at(-1).header.includes('Abschnitt Zwei'));
   assert.ok(chunks[0].embedText.startsWith('[webapp › STATE'));
+
+  // ReDoS safety: long heading with trailing spaces must scan in linear time (<200 ms) (F-05)
+  const evilLine = '# ' + 'x'.repeat(20000) + ' '.repeat(20000) + '!\n\nBody text.';
+  const t0 = performance.now();
+  const evilChunks = chunkText(evilLine, { key: 'redos-check' });
+  assert.ok(performance.now() - t0 < 200, 'scanHeadings must run in linear time without backtracking');
+  assert.ok(evilChunks.length >= 1);
+});
+
+test('CLI parses boolean rule confirmation flags and builder skips symlink Markdown files', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sonar-cli-sym-'));
+  try {
+    // 1. CLI boolean flag coercion for --confirm-rule-write / --confirm-rule-supersede (F-05)
+    const stubBin = path.join(tmp, 'echo-mcp.sh');
+    fs.writeFileSync(stubBin, '#!/usr/bin/env bash\nprintf "%s\\n%s\\n" "$1" "$2"\n', { mode: 0o755 });
+    const cliPath = path.join(REPO_ROOT, 'cli/sonar.mjs');
+    const rOk = spawnSync(
+      process.execPath,
+      [cliPath, 'store', '--key', 'r1', '--value', 'v1', '--kind', 'rule', '--confirm-rule-write', 'true', '--confirm-rule-supersede', 'false'],
+      { env: { ...process.env, SONAR_MCP_BIN: stubBin }, encoding: 'utf8' }
+    );
+    assert.equal(rOk.status, 0);
+    const [, jsonLine] = rOk.stdout.trim().split('\n');
+    const parsedArgs = JSON.parse(jsonLine);
+    assert.strictEqual(parsedArgs.confirm_rule_write, true);
+    assert.strictEqual(parsedArgs.confirm_rule_supersede, false);
+
+    // 2. Symlink .md inside source root must not be read (F-06)
+    const secretFile = path.join(tmp, 'outside.md');
+    fs.writeFileSync(secretFile, '# Outside Secret\n\nShould never be indexed via symlink.\n');
+    const srcRoot = path.join(tmp, 'notes');
+    fs.mkdirSync(srcRoot);
+    fs.writeFileSync(path.join(srcRoot, 'real.md'), '# Real Note\n\nSafe regular markdown.\n');
+    fs.symlinkSync(secretFile, path.join(srcRoot, 'link.md'));
+    const dbPath = path.join(tmp, 'memory.db');
+    const collected = collectAndClassifySources({ database: dbPath, sourceRoots: [srcRoot] });
+    assert.equal(collected.sources.length, 1);
+    assert.equal(collected.sources[0].key, 'real');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test('policy classifies curated vs archive vs excluded and detects .expires & git worktrees', () => {
@@ -111,6 +158,28 @@ test('policy classifies curated vs archive vs excluded and detects .expires & gi
     const fakeHf = ['hf_', 'AbCdEfGhIjKlMnOpQrStUvWx'].join('');
     const fallbackRes = screenSources([{ id: 'x', key: 'k', text: fakeHf }], tmp, { requireGitleaks: false, silentFallback: true });
     assert.equal(fallbackRes.excluded.length, 1);
+
+    // Gitleaks exit 1 (fatal CLI/config error, e.g. Gitleaks < 8.19 lacking `dir`) must fail closed and never cache clean (F1)
+    const fakeBrokenGl = path.join(tmp, 'fake-gitleaks-err.sh');
+    fs.writeFileSync(fakeBrokenGl, '#!/usr/bin/env bash\nif [ "$1" = "version" ]; then echo "8.18.0"; exit 0; fi\necho "unknown command dir" >&2\nexit 1\n', { mode: 0o755 });
+    const glStateDir = path.join(tmp, 'gl-err-state');
+    assert.throws(
+      () => screenSources([{ id: 's1', key: 'k', text: 'clean text' }], glStateDir, { binPath: fakeBrokenGl }),
+      /Secret scan failed \(exit 1/
+    );
+    assert.equal(fs.existsSync(path.join(glStateDir, 'secret-screen-state-v2.json')), false);
+
+    // Gitleaks exit 99 with report.json blocks the offending file cleanly
+    const fakeLeakGl = path.join(tmp, 'fake-gitleaks-leak.sh');
+    fs.writeFileSync(
+      fakeLeakGl,
+      '#!/usr/bin/env bash\nif [ "$1" = "version" ]; then echo "8.24.0"; exit 0; fi\nSCAN_DIR="$2"\nREPORT=""\nwhile [ $# -gt 0 ]; do if [ "$1" = "--report-path" ]; then REPORT="$2"; shift; fi; shift; done\nFIRST_FILE=$(ls "$SCAN_DIR"/*.txt | head -n 1)\nprintf \'[{"File":"%s"}]\' "$FIRST_FILE" > "$REPORT"\nexit 99\n',
+      { mode: 0o755 }
+    );
+    const glLeakDir = path.join(tmp, 'gl-leak-state');
+    const glLeakRes = screenSources([{ id: 'leak-1', key: 'k', text: 'secret value' }], glLeakDir, { binPath: fakeLeakGl });
+    assert.equal(glLeakRes.safe.length, 0);
+    assert.equal(glLeakRes.excluded.length, 1);
 
     // Config path tilde expansion
     const expanded = resolveConfigPaths({ database: '~/sonar/memory.db', sources: ['~/notes'] });

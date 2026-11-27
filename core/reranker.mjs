@@ -143,13 +143,22 @@ export class OfflineReranker {
       }
     }
 
+    const trustBias = (item) => {
+      const t = item?.row?.trust;
+      if (t === 'own-rule') return 2.0;
+      if (t === 'internal-memory') return 1.0;
+      if (t === 'workspace-doc') return -1.5;
+      if (t === 'archive-doc') return -2.0;
+      return 0;
+    };
+
     const rerankedHead = head
       .map((item, i) => ({
         ...item,
         rerankLogit: scores[i].logit,
         rerankScore: Number(scores[i].prob.toFixed(4))
       }))
-      .sort((a, b) => b.rerankLogit - a.rerankLogit);
+      .sort((a, b) => (b.rerankLogit + trustBias(b)) - (a.rerankLogit + trustBias(a)));
 
     return {
       items: [...rerankedHead, ...tail],

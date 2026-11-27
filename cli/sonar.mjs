@@ -29,12 +29,16 @@ const TOOL_MAP = {
 };
 
 function readClientConfig() {
-  const p = process.env.SONAR_CLIENT_CONFIG
-    ? expandHome(process.env.SONAR_CLIENT_CONFIG)
-    : path.join(os.homedir(), '.config', 'sonar', 'client.json');
-  try {
-    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch { /* ignore */ }
+  const candidates = [
+    process.env.SONAR_CLIENT_CONFIG ? expandHome(process.env.SONAR_CLIENT_CONFIG) : null,
+    path.join(os.homedir(), '.config', 'sonar', 'client.json'),
+    path.join(os.homedir(), '.config', 'sonar', 'config.json')
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch { /* ignore */ }
+  }
   return {};
 }
 
@@ -122,7 +126,10 @@ for (let i = 1; i < argv.length; i++) {
     i++;
     if (['limit', 'offset', 'threshold', 'ttl', 'relation_id', 'rerank_k', 'rerank_timeout_ms'].includes(k)) {
       args[k] = Number(next);
-    } else if (['upsert', 'confirm', 'include_history', 'supersede_loser'].includes(k)) {
+    } else if (['upsert', 'confirm', 'confirm_rule_write', 'confirm_rule_supersede', 'include_history', 'include_archive', 'lexical_only', 'supersede_loser', 'smart'].includes(k)) {
+      if (next !== 'true' && next !== 'false') {
+        throw new Error(`Ungültiger boolescher Wert für --${k.replaceAll('_', '-')}: "${next}" (erwartet: true oder false)`);
+      }
       args[k] = next === 'true';
     } else if (k === 'tags' || k === 'namespaces') {
       args[k] = next.split(',').map((s) => s.trim()).filter(Boolean);

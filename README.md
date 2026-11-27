@@ -35,8 +35,9 @@ Sonar is designed as a clean, plug-and-play template. Zero private rules or pers
 
 ### Requirements
 - **Node.js 22+** (tested on Node `24.x`)
-- **Python 3.9+** (for the lightweight zero-dependency MCP stdio proxy)
-- Optional: **Gitleaks** binary for secret screening before indexing
+- **Python 3.9+** (for the lightweight zero-dependency MCP stdio proxy and `node-gyp`)
+- **C/C++ build toolchain** (`Xcode Command Line Tools` on macOS, or `build-essential` on Linux) for compiling `better-sqlite3` from source by default (`SONAR_BUILD_FROM_SOURCE=1`; opt-in `SONAR_BUILD_FROM_SOURCE=0` runs `prebuild-install` to fetch unpinned GitHub release binaries without SHA-256 verification and is not recommended)
+- Optional: **Gitleaks 8.19+** binary (required for the `gitleaks dir` subcommand) for secret screening before indexing
 
 ### 1. Clone and Install
 ```bash
@@ -46,19 +47,18 @@ cd sonar-memory
 ```
 
 What `install.sh` does:
-1. Installs the **3 pinned production dependencies** (`better-sqlite3`, `@huggingface/transformers`, `zod` — 0 high/critical CVEs) with `--ignore-scripts`, builds `better-sqlite3`, and smoke-tests the lockfile-verified bundled `onnxruntime-node` CPU native bindings.
+1. Installs the **3 pinned production dependencies** (`better-sqlite3`, `@huggingface/transformers`, `zod` — 0 high/critical CVEs) with `npm ci --omit=dev --ignore-scripts`, compiles `better-sqlite3` from source by default via `node-gyp` (`npm run build-release`), and smoke-tests the lockfile-verified bundled `onnxruntime-node` CPU native bindings. (If installing manually instead of using `./scripts/install.sh`, always pass `--ignore-scripts` and run `cd node_modules/better-sqlite3 && npm run build-release`; `.npmrc` is intentionally gitignored so local registry tokens are never committed.)
 2. Runs the full unit and contract test suite (`npm test`).
 3. Downloads the two commit-pinned, open-license offline ONNX INT8 models (**MIT** `Xenova/multilingual-e5-small` + **Apache-2.0** `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`) and verifies every weight, tokenizer, and config file's **SHA-256** checksum against `models/manifest.json`.
 4. Initializes an empty `memory.db` schema and creates `~/.config/sonar/config.json` and `~/.config/sonar/policy.json` (mode `0600`).
 5. Installs `~/.local/bin/sonar`, `~/.local/bin/sonar-mcp`, and `~/.local/bin/sonar-check`.
 
 ### 2. Point Sonar at Your Markdown Folders
-Edit `~/.config/sonar/config.json` and add the folders you want indexed:
+Edit `~/.config/sonar/config.json` and add the folders you want indexed (omitted `database`/`index`/`modelRoot`/`socket` keys default to `~/.local/share/sonar/*`; avoid indexing untrusted third-party repositories unless needed):
 ```json
 {
   "sources": [
-    "/Users/you/notes",
-    "/Users/you/projects"
+    "/Users/you/notes"
   ]
 }
 ```
@@ -140,7 +140,7 @@ Every number below was measured on a real production corpus (**22,485 deduplicat
 | **Cross-Lingual `nDCG@10`** | 0.2246 *(30% R@10)* | 0.2790 | 0.3545 | **0.4315** *(+92%)* | **0.5500** *(60% R@10)* |
 | **Vector RAM (Off-Heap)** | 809 MB HNSW + 686 MB f32 | **37.5 MB** | **37.5 MB** | **37.5 MB** *(−97%)* | **37.5 MB** |
 | **Live Service Peak RSS** | 2.6–10.2 GB | 428 MB | 756 MB | **1.23 GB** *(both ONNX preloaded)* | 1.13 GB |
-| **Install Footprint (`node_modules`)** | 1.9 GB | **494 MB** *(0 CVEs)* | **494 MB** | **494 MB** | **494 MB** |
+| **Install Footprint (`node_modules`)** | 1.9 GB | **494 MB** *(0 high/critical CVEs)* | **494 MB** | **494 MB** | **494 MB** |
 
 *Note: All metrics above were measured directly by `eval/harness.mjs` against the live Unix socket and index generations. Results on your machine depend on corpus size, CPU SIMD support (AVX-512 / Apple Silicon), and disk speed.*
 
@@ -197,8 +197,9 @@ sonar-check
 
 - **100% Offline Runtime:** `env.allowRemoteModels = false` and `local_files_only = true` in both embedder and reranker. Run under systemd `PrivateNetwork=yes` + `ProtectSystem=strict` + `NoNewPrivileges=yes` (see `deploy/sonar.service.example`).
 - **Commit-Pinned SHA-256 Model Verification:** `download-models.mjs` fetches immutable 40-character Hugging Face commit revisions, and every ONNX weight, tokenizer, and config file is verified against `models/manifest.json` before loading (fail-closed). Only permissive open-source models (**MIT** and **Apache-2.0**) are accepted.
-- **Trusted Root Scoping (`trustedRoots`):** Markdown files only receive `trust: "own-rule"`, non-expiring `kind: "rule"`, or same-root frontmatter `superseded_by` redirection when located inside directories explicitly listed in `trustedRoots`. Cloned third-party repositories under `~/projects` are always treated as untrusted `workspace-doc` and cannot hijack search hits.
-- **Secret Screening Gate:** `core/secret-screen.mjs` integrates Gitleaks (versioning both binary version and `gitleaks.toml` hash in its cache key) and fails closed if an explicit `SONAR_GITLEAKS_BIN` or `SONAR_GITLEAKS_CONFIG` is configured but missing/unreadable; when no binary is configured, it warns on `stderr` and applies an expanded built-in regex gate.
+- **Trusted Root Scoping (`trustedRoots`), Trust-Weighted Ranking & Untrusted Content Framing:** Markdown files only receive `trust: "own-rule"`, non-expiring `kind: "rule"`, or same-root frontmatter `superseded_by` redirection when located inside directories explicitly listed in `trustedRoots`. Files outside `trustedRoots` are classified as `workspace-doc` (or `archive-doc`), strongly demoted via trust weights in **both** hybrid RRF (`0.55x` / `0.45x` vs `1.25x` for `own-rule` and `1.0x` for `internal-memory`) and Cross-Encoder reranking (`-1.5` / `-2.0` logit bias vs `+2.0` / `+1.0`), and flagged with `untrusted: true` plus `content_warning` in `memory_search`, `memory_source`, and `memory_sources` outputs. Soft trust weighting reduces prompt-injection priority on comparable matches rather than hard-blocking untrusted passages, so avoid indexing untrusted third-party repositories unless you actually need them.
+- **Persistent Memory Write Guard:** `memory_store`, `memory_supersede`, `memory_resolve`, `memory_delete`, and `memory_purge` carry `destructiveHint: true` in MCP annotations. By default, the MCP daemon sets `"allowMcpRuleMutations": false` (`config.json`), blocking any MCP mutation of `kind: "rule"` or `provenance_type: "user_claim"` entries at the server boundary even if an MCP client auto-approves `destructiveHint: true` tools. Operators who explicitly enable `"allowMcpRuleMutations": true` still require explicit `confirm_rule_write: true` or `confirm_rule_supersede: true` for creating, overwriting (including archived or soft-deleted entries), deleting, purging, or superseding `kind: "rule"` or `user_claim` entries (which then depends on the MCP client prompting the user on `destructiveHint: true` tools). Tags and metadata (capped at `16 KiB`) pass through the same secret screening gate as `value`.
+- **Secret Screening Gate:** `core/secret-screen.mjs` integrates **Gitleaks 8.19+** (`gitleaks dir --exit-code 99`, versioning both binary version and `gitleaks.toml` hash in its cache key) and fails closed on any non-zero/non-99 exit, missing/invalid JSON report, or missing/unreadable `SONAR_GITLEAKS_BIN` / `SONAR_GITLEAKS_CONFIG`; when no binary is configured, it warns on `stderr` and applies an expanded built-in regex gate.
 - **Strict RPC Schema Validation:** All 16 MCP tools validate incoming `params.arguments` with `zod` at the daemon boundary (enforcing types, bounds, and length limits before touching SQLite or the worker).
 - **Zero Telemetry:** No analytics, no remote pings, no external fonts or SaaS calls.
 - **Clean Repo Separation:** Personal exclusion patterns, project rules, and private evaluation suites live strictly outside the repository (`~/.config/sonar/policy.json`, `config.json`).
@@ -227,11 +228,15 @@ For Linux servers, see `deploy/sonar.service.example`, `deploy/sonar-reindex.ser
   - macOS (Apple Silicon, Node `24.x`, Python `3.12+`)
   - Ubuntu Linux x86_64 (AVX-512 capable host, Node `24.x`, SQLite `3.x`, systemd)
 - **Scale Target:** INT8 flat-scan is ideal up to **~250,000 curated vectors** (`< 100 MB` RAM, exact filter recall). Beyond ~500k curated vectors, shard by namespace or swap in an ANN index.
-- **Dependencies:** 3 runtime npm packages (`better-sqlite3`, `@huggingface/transformers`, `zod`). `install.sh` runs `npm ci --ignore-scripts` and invokes `better-sqlite3`'s install script (which downloads a prebuilt native `.node` binary for your Node ABI, or compiles from source when you pass `SONAR_BUILD_FROM_SOURCE=1`).
+- **Dependencies:** 3 runtime npm packages (`better-sqlite3`, `@huggingface/transformers`, `zod`). Always install via `./scripts/install.sh` (or `npm ci --omit=dev --ignore-scripts` followed by `cd node_modules/better-sqlite3 && npm run build-release`) rather than bare `npm install` so transitive postinstall hooks never run; `.npmrc` is intentionally gitignored to avoid accidental auth-token commits. `install.sh` compiles `better-sqlite3` from source via `node-gyp` by default (`SONAR_BUILD_FROM_SOURCE=1`; opt-in `SONAR_BUILD_FROM_SOURCE=0` runs `prebuild-install` to fetch unpinned GitHub release binaries without SHA-256 verification).
 - **Reranker Latency Budget:** On heavily loaded CPUs, `rerank: "auto"` enforces a strict `250 ms` deadline and falls back cleanly to hybrid RRF rankings so agent sessions never stall.
 
 ---
 
 ## License
 
-MIT License — Copyright (c) 2026 Timothy Scherman. See [LICENSE](LICENSE).
+MIT License — Copyright (c) 2026 [Timothy Scherman](https://timothyscherman.com). See [LICENSE](LICENSE).
+
+---
+
+Built by **Timothy Scherman** ([timothyscherman.com](https://timothyscherman.com)). Less AI theater. More results.

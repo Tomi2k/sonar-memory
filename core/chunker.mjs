@@ -25,13 +25,15 @@ function buildHeaderPrefix(meta, h1, h2) {
  */
 function scanHeadings(text) {
   const headings = [];
-  const re = /^(#{1,3})\s+(.+?)\s*$/gm;
+  const re = /^(#{1,3})[ \t]+([^\r\n]+)$/gm;
   let m;
   while ((m = re.exec(text)) !== null) {
+    const title = m[2].replace(/[#*`]/g, '').trim().slice(0, 90);
+    if (!title) continue;
     headings.push({
       pos: m.index,
       level: m[1].length,
-      title: m[2].replace(/[#*`]/g, '').trim().slice(0, 90)
+      title
     });
   }
   return headings;

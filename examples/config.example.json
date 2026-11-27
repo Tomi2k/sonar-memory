@@ -6,10 +6,10 @@
   "socketMode": 384,
   "policyFile": "~/.config/sonar/policy.json",
   "sources": [
-    "~/notes",
-    "~/projects"
+    "~/notes"
   ],
   "trustedRoots": [],
+  "allowMcpRuleMutations": false,
   "embeddingModel": "Xenova/multilingual-e5-small",
   "rerankerModel": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
   "rerankerEnabled": true,

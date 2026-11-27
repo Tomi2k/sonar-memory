@@ -77,8 +77,13 @@ function acquireIndexLock(indexRoot) {
       try {
         const pid = Number(fs.readFileSync(lockPath, 'utf8').split('\n')[0]);
         if (pid > 0) {
-          process.kill(pid, 0);
-          alive = true;
+          try {
+            process.kill(pid, 0);
+            alive = true;
+          } catch (killErr) {
+            // EPERM means a live process owned by another UID holds the lock; only ESRCH means dead.
+            alive = killErr?.code !== 'ESRCH';
+          }
         }
       } catch { alive = false; }
       if (alive || attempt > 0) {
@@ -217,14 +222,25 @@ export function collectAndClassifySources({ database, sourceRoots = [], policy =
             continue;
           }
           let st;
-          try { st = fs.statSync(full); } catch { continue; }
-          const cls = classifyMarkdownSource(rel, e.name, st.size, pol);
-          if (cls.tier === 'exclude') {
-            bumpSkip(cls.reason);
-            continue;
-          }
+          let cls;
           let text;
-          try { text = fs.readFileSync(full, 'utf8'); } catch { continue; }
+          let fd = null;
+          try {
+            const openFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+            fd = fs.openSync(full, openFlags);
+            st = fs.fstatSync(fd);
+            if (!st.isFile()) continue;
+            cls = classifyMarkdownSource(rel, e.name, st.size, pol);
+            if (cls.tier === 'exclude') {
+              bumpSkip(cls.reason);
+              continue;
+            }
+            text = fs.readFileSync(fd, 'utf8');
+          } catch {
+            continue;
+          } finally {
+            if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+          }
           const { fmStatus, fmSupersededBy } = parseFrontmatterStatus(text);
           const project = detectProject(rel, pol);
           const baseSrc = {
@@ -366,6 +382,7 @@ export async function buildIndexGeneration({
     embInfo.modelId,
     embInfo.modelHash,
     screened.scannerSignature,
+    collected.latestPurgeSeq || 0,
     sources.map((s) => [s.id, s.hash, s.tier, s.status, s.trust, s.kind, s.project, s.superseded_by])
   ]);
   const fingerprint = sha(fpInput).slice(0, 24);
@@ -728,8 +745,8 @@ export async function buildIndexGeneration({
     }
 
     if (activate) {
-      const tmpCur = path.join(indexRoot, `CURRENT.${process.pid}.tmp`);
-      fs.writeFileSync(tmpCur, generation + '\n', { mode: 0o600 });
+      const tmpCur = path.join(indexRoot, `CURRENT.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+      fs.writeFileSync(tmpCur, generation + '\n', { mode: 0o600, flag: 'wx' });
       fs.renameSync(tmpCur, path.join(indexRoot, 'CURRENT'));
       cleanupOldGenerations(indexRoot, generation, 2, collected.latestPurgeSeq);
     }

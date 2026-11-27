@@ -10,7 +10,14 @@ export function expandHome(p) {
 }
 
 export function resolveConfigPaths(cfg = {}) {
-  const out = { ...cfg };
+  const defaultBase = path.join(os.homedir(), '.local', 'share', 'sonar');
+  const out = {
+    database: path.join(defaultBase, 'memory.db'),
+    index: path.join(defaultBase, 'index'),
+    modelRoot: path.join(defaultBase, 'models'),
+    socket: path.join(defaultBase, 'sonar.sock'),
+    ...cfg
+  };
   for (const key of ['database', 'index', 'modelRoot', 'policyFile', 'telemetryPath']) {
     if (typeof out[key] === 'string' && out[key]) {
       out[key] = path.resolve(expandHome(out[key]));

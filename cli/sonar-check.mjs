@@ -22,6 +22,7 @@ function readUserConfig() {
   const candidates = [
     process.env.SONAR_CLIENT_CONFIG ? expandHome(process.env.SONAR_CLIENT_CONFIG) : null,
     path.join(os.homedir(), '.config', 'sonar', 'client.json'),
+    path.join(os.homedir(), '.config', 'sonar', 'config.json'),
     '/etc/sonar/config.json'
   ].filter(Boolean);
   for (const p of candidates) {
@@ -128,7 +129,11 @@ function saveCache(cacheFile, result) {
 
 const cfg = readUserConfig();
 const explicitLocalSocket = Boolean((process.env.SONAR_SOCKET || cfg.socket) && !process.env.SONAR_SSH_HOST);
-const localSocket = expandHome(process.env.SONAR_SOCKET || cfg.socket || process.env.SONAR_DEFAULT_SOCKET || '/run/sonar/mcp.sock');
+const defaultUserSocket = path.join(os.homedir(), '.local', 'share', 'sonar', 'sonar.sock');
+const fallbackSocket = (fs.existsSync(defaultUserSocket) || !fs.existsSync('/run/sonar/mcp.sock'))
+  ? defaultUserSocket
+  : '/run/sonar/mcp.sock';
+const localSocket = expandHome(process.env.SONAR_SOCKET || cfg.socket || process.env.SONAR_DEFAULT_SOCKET || fallbackSocket);
 const sshHost = explicitLocalSocket ? '' : (process.env.SONAR_SSH_HOST || cfg.sshHost || '');
 const remoteBin = process.env.SONAR_REMOTE_BIN || cfg.remoteBin || '/usr/local/bin/sonar-mcp';
 const cacheFile = path.join(os.homedir(), '.cache', 'sonar', 'health.json');
